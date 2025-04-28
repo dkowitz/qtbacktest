@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QPushButton,
     QSizePolicy,
+    QMenu,
 )
 
 # Local import for editor dock
@@ -138,6 +139,7 @@ class DatasetManager:
         # callbacks taking the newly added dataset *name* as their only arg
         self._listeners: List[Callable[[str], None]] = []
         self._overlay_listeners: List[Callable[[str, "Overlay"], None]] = []
+        self._remove_listeners: List[Callable[[str], None]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -197,6 +199,32 @@ class DatasetManager:
         self._datasets[name] = df
         self._notify_listeners(name)
         return name
+        
+    def remove_dataset(self, name: str) -> bool:
+        """Remove a dataset from the manager.
+        
+        Parameters
+        ----------
+        name
+            The name of the dataset to remove.
+            
+        Returns
+        -------
+        bool
+            True if the dataset was removed, False if it wasn't found.
+        """
+        if name in self._datasets:
+            # Remove the dataset
+            del self._datasets[name]
+            
+            # Remove any associated overlays
+            if name in self._overlays:
+                del self._overlays[name]
+                
+            # Notify listeners
+            self._notify_remove_listeners(name)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Overlay helpers
@@ -237,6 +265,11 @@ class DatasetManager:
     def add_overlay_listener(self, fn: Callable[[str, "Overlay"], None]):
         if fn not in self._overlay_listeners:
             self._overlay_listeners.append(fn)
+            
+    def add_remove_listener(self, fn: Callable[[str], None]):
+        """Register *fn* to be called whenever a dataset is removed."""
+        if fn not in self._remove_listeners:
+            self._remove_listeners.append(fn)
 
     # Internal -----------------------------------------------------------
 
@@ -256,6 +289,14 @@ class DatasetManager:
             except Exception:
                 import traceback
 
+                traceback.print_exc()
+                
+    def _notify_remove_listeners(self, name: str):
+        for fn in self._remove_listeners:
+            try:
+                fn(name)
+            except Exception:
+                import traceback
                 traceback.print_exc()
 
 
@@ -653,21 +694,30 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         # Dataset navigator -------------------------------------------------------
-        self._nav_dock = QDockWidget("Datasets", self)
+        self._nav_dock = QDockWidget("Datasets (F2)", self)
         self._nav_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
 
         self._nav_list = QListWidget()
         self._nav_list.itemDoubleClicked.connect(self._open_dataset_in_tab)
+        
+        # Set up the context menu for the dataset list
+        self._nav_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._nav_list.customContextMenuRequested.connect(self._show_dataset_context_menu)
+        
         self._nav_dock.setWidget(self._nav_list)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._nav_dock)
 
         # Listen to dataset additions so navigator stays in sync
         DS_MANAGER.add_listener(self._on_dataset_added)
+        # Listen to dataset removals
+        DS_MANAGER.add_remove_listener(self._on_dataset_removed)
 
         # Python console ----------------------------------------------------------
+        self._console_dock = None
+        self._console_widget = None
         if _HAS_QTCONSOLE:
             try:
-                self._console_dock = QDockWidget("Python Console", self)
+                self._console_dock = QDockWidget("Python Console (F4)", self)
                 self._console_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
 
                 self._console_widget = _create_ipython_console(
@@ -690,6 +740,8 @@ class MainWindow(QMainWindow):
                 
         # Code Editor -------------------------------------------------------------
         # Import editor module here when we know QApplication exists
+        self._editor_dock = None
+        self._editor_widget = None
         try:
             global HAS_EDITOR
             
@@ -707,7 +759,7 @@ class MainWindow(QMainWindow):
                         sys.path.append(current_dir)
                     from fallback_editor import EditorDockWidget  # type: ignore
                     
-            self._editor_dock = QDockWidget("Strategy Editor", self)
+            self._editor_dock = QDockWidget("Strategy Editor (F3)", self)
             self._editor_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
             
             self._editor_widget = EditorDockWidget(self)
@@ -731,10 +783,42 @@ class MainWindow(QMainWindow):
             self._editor_dock = None
             self._editor_widget = None
 
+        # ------------------------------------------------------
+        # Strategy dock
+        # ------------------------------------------------------
+
+        try:
+            from qt_prototype.strategy_ui import StrategyDockWidget  # type: ignore
+        except ModuleNotFoundError:  # running as script
+            from strategy_ui import StrategyDockWidget  # type: ignore
+
+        strat_widget = StrategyDockWidget(self)
+        strat_widget.run_requested.connect(self._run_strategy)
+
+        self._strategy_dock = QDockWidget("Strategies (F5)", self)
+        self._strategy_dock.setWidget(strat_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._strategy_dock)
+
+        # Results dock ---------------------------------------------------
+        try:
+            from qt_prototype.results_ui import ResultsDockWidget  # type: ignore
+        except ModuleNotFoundError:
+            from results_ui import ResultsDockWidget  # type: ignore
+
+        self._results_widget = ResultsDockWidget(self)
+        self._results_widget.open_requested.connect(self._show_result_tab)
+        self._results_dock = QDockWidget("Results (F6)", self)
+        self._results_dock.setWidget(self._results_widget)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self._results_dock)
+
         # Menu & actions ----------------------------------------------------------
         open_act = QAction("&Load CSV…", self)
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._load_csv)
+
+        toggle_datasets_act = QAction("Toggle &Datasets", self)
+        toggle_datasets_act.setShortcut("F2")
+        toggle_datasets_act.triggered.connect(lambda: self._toggle_dock(self._nav_dock))
 
         toggle_console_act = QAction("Toggle &Console", self)
         toggle_console_act.setShortcut("F4")
@@ -743,6 +827,14 @@ class MainWindow(QMainWindow):
         toggle_editor_act = QAction("Toggle &Editor", self)
         toggle_editor_act.setShortcut("F3")
         toggle_editor_act.triggered.connect(self._toggle_editor)
+        
+        toggle_strategies_act = QAction("Toggle &Strategies", self)
+        toggle_strategies_act.setShortcut("F5")
+        toggle_strategies_act.triggered.connect(lambda: self._toggle_dock(self._strategy_dock))
+        
+        toggle_results_act = QAction("Toggle &Results", self)
+        toggle_results_act.setShortcut("F6")
+        toggle_results_act.triggered.connect(lambda: self._toggle_dock(self._results_dock))
         
         new_strategy_act = QAction("&New Strategy", self)
         new_strategy_act.setShortcut("Ctrl+N")
@@ -758,43 +850,24 @@ class MainWindow(QMainWindow):
         file_menu.addAction(edit_strategy_act)
 
         view_menu = self.menuBar().addMenu("&View")
-        view_menu.addAction(toggle_console_act)
-        view_menu.addAction(toggle_editor_act)
-
-        # ------------------------------------------------------
-        # Strategy dock
-        # ------------------------------------------------------
-
-        try:
-            from qt_prototype.strategy_ui import StrategyDockWidget  # type: ignore
-        except ModuleNotFoundError:  # running as script
-            from strategy_ui import StrategyDockWidget  # type: ignore
-
-        strat_widget = StrategyDockWidget(self)
-        strat_widget.run_requested.connect(self._run_strategy)
-
-        self._strategy_dock = QDockWidget("Strategies", self)
-        self._strategy_dock.setWidget(strat_widget)
-        self.addDockWidget(Qt.RightDockWidgetArea, self._strategy_dock)
-
-        # Results dock ---------------------------------------------------
-        try:
-            from qt_prototype.results_ui import ResultsDockWidget  # type: ignore
-        except ModuleNotFoundError:
-            from results_ui import ResultsDockWidget  # type: ignore
-
-        self._results_widget = ResultsDockWidget(self)
-        self._results_widget.open_requested.connect(self._show_result_tab)
-        self._results_dock = QDockWidget("Results", self)
-        self._results_dock.setWidget(self._results_widget)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self._results_dock)
+        view_menu.addAction(toggle_datasets_act)
+        view_menu.addAction(toggle_strategies_act)
+        view_menu.addAction(toggle_results_act)
+        
+        if self._console_dock:
+            view_menu.addAction(toggle_console_act)
+            
+        if self._editor_dock:
+            view_menu.addAction(toggle_editor_act)
 
     # ------------------------------------------------------------------
     # Slots / callbacks
     # ------------------------------------------------------------------
 
     def _load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select CSV file", str(Path.home()), "CSV files (*.csv)")
+        import os
+        current_dir = os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(self, "Select CSV file", current_dir, "CSV files (*.csv)")
         if not path:
             return
 
@@ -860,6 +933,14 @@ class MainWindow(QMainWindow):
         if not any(self._nav_list.item(i).text() == name for i in range(self._nav_list.count())):
             self._nav_list.addItem(name)
 
+    def _on_dataset_removed(self, name: str):
+        """Callback from DatasetManager when a dataset is removed."""
+        # Find and remove the item from the list widget
+        for i in range(self._nav_list.count()):
+            if self._nav_list.item(i).text() == name:
+                self._nav_list.takeItem(i)
+                break
+
     # ------------------------------------------------------------------
     # Console helpers
     # ------------------------------------------------------------------
@@ -877,8 +958,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Console unavailable", "Failed to initialize IPython console. Check console output for details.")
             return
 
-        visible = self._console_dock.isVisible()
-        self._console_dock.setVisible(not visible)
+        self._toggle_dock(self._console_dock)
 
     def _toggle_editor(self):
         if self._editor_dock is None:
@@ -886,8 +966,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Editor unavailable", "Failed to initialize code editor. Check console output for details.")
             return
             
-        visible = self._editor_dock.isVisible()
-        self._editor_dock.setVisible(not visible)
+        self._toggle_dock(self._editor_dock)
 
     # Add a new method to handle tab closing
     def _close_tab(self, index):
@@ -968,7 +1047,10 @@ class MyNewStrategy(Strategy):
         from pathlib import Path
         
         # Try to find the strategies directory
+        current_dir = os.getcwd()
         possible_paths = [
+            Path(current_dir) / "strategies",
+            Path(current_dir) / "btest" / "strategies",
             Path("strategies"),
             Path("btest/strategies"),
             Path(__file__).parent.parent / "strategies",
@@ -987,7 +1069,7 @@ class MyNewStrategy(Strategy):
                 "Strategy Directory Not Found", 
                 "Could not locate the 'strategies' directory. Please manually navigate to your strategy file."
             )
-            initial_dir = str(Path.home())
+            initial_dir = current_dir
         else:
             initial_dir = str(strategy_dir)
             
@@ -1000,6 +1082,96 @@ class MyNewStrategy(Strategy):
             self._editor_widget.editor.open_file(file_path)
             self._editor_dock.show()
             self._editor_dock.raise_()
+
+    def _show_dataset_context_menu(self, pos):
+        item = self._nav_list.itemAt(pos)
+        if item:
+            name = item.text()
+            menu = QMenu()
+            
+            # Add "Export Dataset" action
+            export_act = QAction("Export Dataset", self)
+            export_act.triggered.connect(lambda: self._export_dataset(name))
+            menu.addAction(export_act)
+            
+            # Add "Remove Dataset" action
+            remove_act = QAction("Remove Dataset", self)
+            remove_act.triggered.connect(lambda: self._remove_dataset(name))
+            menu.addAction(remove_act)
+            
+            menu.exec(self._nav_list.mapToGlobal(pos))
+
+    def _export_dataset(self, name):
+        """Export the selected dataset to a CSV file."""
+        from PySide6.QtWidgets import QFileDialog
+        import os
+        
+        # Get the default filename based on the dataset name
+        default_filename = f"{name}.csv"
+        current_dir = os.path.join(os.getcwd(), default_filename)
+        
+        # Open a file dialog to choose where to save the file
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Dataset",
+            current_dir,
+            "CSV Files (*.csv);;All Files (*.*)"
+        )
+        
+        if filepath:
+            try:
+                # Get the dataset and export it
+                df = DS_MANAGER[name]
+                df.to_csv(filepath, index=True)
+                
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self,
+                    "Export Successful",
+                    f"Dataset '{name}' was successfully exported to:\n{filepath}"
+                )
+            except Exception as e:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(
+                    self,
+                    "Export Failed",
+                    f"Failed to export dataset '{name}'.\nError: {str(e)}"
+                )
+
+    def _remove_dataset(self, name):
+        """Remove a dataset from the dataset manager."""
+        from PySide6.QtWidgets import QMessageBox
+        
+        # Ask for confirmation before removing
+        reply = QMessageBox.question(
+            self, 
+            "Remove Dataset",
+            f"Are you sure you want to remove dataset '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # Close any open tabs showing this dataset
+            for i in range(self._tabs.count()):
+                widget = self._tabs.widget(i)
+                if isinstance(widget, Workspace) and widget.dataset_name == name:
+                    self._tabs.removeTab(i)
+                    break
+            
+            # Remove the dataset
+            if DS_MANAGER.remove_dataset(name):
+                # No need to update the list view manually as we've added a listener
+                pass
+
+    # ------------------------------------------------------------------
+    # Dock visibility helpers
+    # ------------------------------------------------------------------
+    
+    def _toggle_dock(self, dock):
+        """Toggle visibility of a dock widget."""
+        if dock:
+            dock.setVisible(not dock.isVisible())
 
 
 # -------------------------------------------------------------------------

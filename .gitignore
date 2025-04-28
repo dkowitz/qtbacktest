@@ -4,3 +4,7 @@ __pycache__/
 *.py[cod]
 *.class
 
+# Data files
+data/
+*.csv
+
