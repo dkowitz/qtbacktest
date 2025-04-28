@@ -1,0 +1,6 @@
+# Virtual environments
+wqt_bt/
+__pycache__/
+*.py[cod]
+*.class
+
