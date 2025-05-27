@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QStyle,
     QPlainTextEdit,
+    QTabWidget,
+    QTabBar
 )
 
 
@@ -273,44 +275,35 @@ class CodeEditor(QWidget):
     def open_file(self, file_path=None):
         """Open a file in the editor."""
         try:
-            print("Open file method called")
-            
             if not self._check_save_changes():
-                print("Save changes check failed")
                 return False
             
             if file_path is None:
                 # Get strategies directory as default location
                 default_dir = self._get_strategies_dir()
-                print(f"Opening file dialog with default dir: {default_dir}")
                 
                 file_path, _ = QFileDialog.getOpenFileName(
                     self, "Open Strategy File", default_dir,
                     "Python Files (*.py);;All Files (*.*)"
                 )
-                print(f"Selected file: {file_path or 'None'}")
             
             if file_path:
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                        print(f"Read {len(content)} characters from file")
                         self.set_text(content)
                     self._current_file = file_path
                     self._modified = False
                     self._update_window_title()
-                    print("File loaded successfully")
                     return True
                 except Exception as e:
-                    print(f"Error opening file: {e}")
                     QMessageBox.critical(self, "Error", f"Could not open file: {str(e)}")
             else:
-                print("No file selected")
+                pass
             
             return False
         except Exception as e:
             import traceback
-            print(f"Exception in open_file: {e}")
             traceback.print_exc()
             return False
     
@@ -417,106 +410,241 @@ class CodeEditor(QWidget):
             return str(Path.home())
 
 
+class TabbedEditorWidget(QTabWidget):
+    """A tabbed widget that contains multiple code editors."""
+    
+    saved = Signal(str)  # emitted when a file is saved: path
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        self.setTabsClosable(True)
+        self.setMovable(True)
+        self.setDocumentMode(True)
+        
+        # Connect signals
+        self.tabCloseRequested.connect(self._close_tab)
+        
+        # Create the "+" tab for adding new files
+        self.addTab(QWidget(), "+")
+        self.tabBar().setTabButton(0, QTabBar.RightSide, None)  # Hide the close button on the "+" tab
+        
+        self.currentChanged.connect(self._handle_tab_change)
+        
+    def _handle_tab_change(self, index):
+        """Handle tab change events, including the special "+" tab."""
+        if index == 0:  # The "+" tab
+            # Create a new untitled file
+            self.new_file()
+            # Switch back to the newly created tab
+            self.setCurrentIndex(1)  # The new tab will be at index 1
+    
+    def current_editor(self):
+        """Return the currently active editor."""
+        if self.count() <= 1:  # Only the "+" tab
+            return None
+            
+        current_widget = self.currentWidget()
+        if isinstance(current_widget, CodeEditor):
+            return current_widget
+        return None
+    
+    def new_file(self):
+        """Create a new untitled file tab."""
+        editor = CodeEditor(self)
+        editor.saved.connect(self._on_file_saved)
+        
+        index = self.addTab(editor, "Untitled")
+        self.setCurrentIndex(index)
+        return editor
+    
+    def open_file(self, file_path=None):
+        """Open a file in a new tab or prompt for a file to open."""
+        # If no file_path is provided, show a file dialog
+        if file_path is None:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Open File", self._get_strategies_dir(),
+                "Python Files (*.py);;All Files (*.*)"
+            )
+            
+        if not file_path:
+            return None
+            
+        # Check if this file is already open
+        for i in range(1, self.count()):  # Skip the "+" tab
+            editor = self.widget(i)
+            if isinstance(editor, CodeEditor) and editor._current_file == file_path:
+                self.setCurrentIndex(i)
+                return editor
+        
+        # Create a new tab with this file
+        editor = CodeEditor(self)
+        editor.saved.connect(self._on_file_saved)
+        
+        # Open the file in the editor
+        with open(file_path, 'r', encoding='utf-8') as f:
+            editor.set_text(f.read())
+            
+        editor._current_file = file_path
+        editor._modified = False
+        
+        # Add to tabs with filename as the tab title
+        filename = Path(file_path).name
+        index = self.addTab(editor, filename)
+        self.setCurrentIndex(index)
+        
+        return editor
+    
+    def _close_tab(self, index):
+        """Close the tab at the given index."""
+        if index == 0:  # Don't close the "+" tab
+            return
+            
+        editor = self.widget(index)
+        if isinstance(editor, CodeEditor):
+            if editor._modified:
+                # Ask to save changes
+                reply = QMessageBox.question(
+                    self, "Save Changes",
+                    f"Save changes to {Path(editor._current_file).name if editor._current_file else 'Untitled'}?",
+                    QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
+                )
+                
+                if reply == QMessageBox.Save:
+                    saved = editor.save_file()
+                    if not saved:
+                        return  # Abort closing if save was cancelled
+                elif reply == QMessageBox.Cancel:
+                    return  # Abort closing
+            
+        self.removeTab(index)
+    
+    def _on_file_saved(self, path):
+        """Update tab title when a file is saved."""
+        for i in range(1, self.count()):
+            editor = self.widget(i)
+            if isinstance(editor, CodeEditor) and editor._current_file == path:
+                self.setTabText(i, Path(path).name)
+                break
+                
+        # Forward the signal
+        self.saved.emit(path)
+    
+    def _get_strategies_dir(self):
+        """Find the likely strategies directory."""
+        # Look for strategies directory relative to the current file
+        possible_paths = [
+            Path("strategies"),
+            Path("btest/strategies"),
+            Path(__file__).parent.parent / "strategies",
+        ]
+        
+        # Try to find current working directory
+        try:
+            import os
+            current_dir = os.getcwd()
+            possible_paths.insert(0, Path(current_dir) / "strategies")
+        except Exception:
+            pass
+            
+        for path in possible_paths:
+            if path.exists() and path.is_dir():
+                return str(path)
+                
+        # Fallback to current directory or home
+        try:
+            return os.getcwd()
+        except Exception:
+            return str(Path.home())
+
+
 class EditorDockWidget(QWidget):
-    """Dock widget containing the code editor with file management controls."""
+    """A widget with a code editor, toolbar, and status bar."""
     
     def __init__(self, parent=None):
         super().__init__(parent)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(0, 0, 0, 0)
         
-        # Add toolbar with common actions
-        toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        # Toolbar
+        toolbar = QToolBar()
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         
-        # Create toolbar buttons - try to use icons if available
-        try:
-            style = QApplication.style()
-            new_btn = QPushButton(style.standardIcon(QStyle.SP_FileIcon), "")
-            open_btn = QPushButton(style.standardIcon(QStyle.SP_DialogOpenButton), "")
-            save_btn = QPushButton(style.standardIcon(QStyle.SP_DialogSaveButton), "")
-        except Exception:
-            # Fallback to text buttons
-            new_btn = QPushButton("New")
-            open_btn = QPushButton("Open")
-            save_btn = QPushButton("Save")
+        # Add actions
+        new_action = toolbar.addAction("New")
+        new_action.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        new_action.triggered.connect(lambda: self._handle_button_click("new"))
         
-        new_btn.setToolTip("New File (Ctrl+N)")
-        open_btn.setToolTip("Open File (Ctrl+O)")
-        save_btn.setToolTip("Save File (Ctrl+S)")
+        open_action = toolbar.addAction("Open")
+        open_action.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        open_action.triggered.connect(lambda: self._handle_button_click("open"))
         
-        # Add file name label
-        self.file_label = QLabel("No file loaded")
-        self.file_label.setStyleSheet("color: #888888; font-style: italic;")
+        save_action = toolbar.addAction("Save")
+        save_action.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        save_action.triggered.connect(lambda: self._handle_button_click("save"))
         
-        toolbar_layout.addWidget(new_btn)
-        toolbar_layout.addWidget(open_btn)
-        toolbar_layout.addWidget(save_btn)
-        toolbar_layout.addWidget(self.file_label, 1)  # Label takes remaining space
+        toolbar.addSeparator()
+        
+        run_action = toolbar.addAction("Run")
+        run_action.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        run_action.triggered.connect(lambda: self._handle_button_click("run"))
         
         layout.addWidget(toolbar)
         
-        # Create and add the editor
-        self.editor = CodeEditor(self)
-        layout.addWidget(self.editor)
+        # Tabbed editor
+        self.editor_tabs = TabbedEditorWidget(self)
+        self.editor_tabs.saved.connect(self._on_file_saved)
+        layout.addWidget(self.editor_tabs)
         
-        # Connect toolbar buttons - use lambda to ensure proper connections
-        new_btn.clicked.connect(lambda: self._handle_button_click("new"))
-        open_btn.clicked.connect(lambda: self._handle_button_click("open"))
-        save_btn.clicked.connect(lambda: self._handle_button_click("save"))
+        # Make sure we have at least one editor tab (after the "+" tab)
+        self.editor_tabs.new_file()
         
-        # Status bar (optional)
+        # Status bar
         self.status_bar = QStatusBar()
         self.status_label = QLabel("Ready")
         self.status_bar.addWidget(self.status_label)
         layout.addWidget(self.status_bar)
         
-        # Set initial status
-        self.editor.saved.connect(self._on_file_saved)
+        self.setLayout(layout)
+    
+    @property
+    def editor(self):
+        """Return the currently active editor for backward compatibility."""
+        return self.editor_tabs.current_editor()
     
     def _handle_button_click(self, action):
-        """Handle toolbar button clicks with better error reporting."""
-        try:
-            if action == "new":
-                self.editor.new_file()
-                self.status_label.setText("Created new file")
-                self.file_label.setText("New file (unsaved)")
-                self.file_label.setStyleSheet("color: #888888; font-style: italic;")
-            elif action == "open":
-                if self.editor.open_file():
-                    filename = os.path.basename(self.editor._current_file)
-                    self.status_label.setText(f"Opened: {filename}")
-                    self.file_label.setText(filename)
-                    self.file_label.setStyleSheet("color: #000000; font-style: normal;")
-                else:
-                    self.status_label.setText("Open file cancelled or failed")
-            elif action == "save":
-                if self.editor.save_file():
-                    filename = os.path.basename(self.editor._current_file)
-                    self.status_label.setText(f"Saved: {filename}")
-                    self.file_label.setText(filename)
-                    self.file_label.setStyleSheet("color: #000000; font-style: normal;")
-                else:
-                    self.status_label.setText("Save failed or cancelled")
-        except Exception as e:
-            import traceback
-            self.status_label.setText(f"Error: {str(e)}")
-            traceback.print_exc()
+        """Handle toolbar button clicks."""
+        if action == "new":
+            self.editor_tabs.new_file()
+        elif action == "open":
+            self.editor_tabs.open_file()
+        elif action == "save":
+            editor = self.editor_tabs.current_editor()
+            if editor:
+                editor.save_file()
+        elif action == "run":
+            editor = self.editor_tabs.current_editor()
+            if editor and editor._current_file:
+                self.set_status(f"Running {editor._current_file}...")
+                # TODO: Implement running the strategy
+                # For now, just show a message
+                QMessageBox.information(
+                    self,
+                    "Run Strategy",
+                    f"Would run strategy: {editor._current_file}"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Cannot Run",
+                    "Please save the file first before running."
+                )
     
     def _on_file_saved(self, path):
-        """Update status bar when a file is saved."""
-        filename = os.path.basename(path)
-        self.status_label.setText(f"Saved: {filename}")
-        self.file_label.setText(filename)
-        self.file_label.setStyleSheet("color: #000000; font-style: normal;")
-        
-        # Try to update window title if we're in a dock widget
-        dock = self.parent()
-        if hasattr(dock, "setWindowTitle"):
-            dock.setWindowTitle(f"Editor - {filename}")
-            
+        """Handle file saved event from any editor tab."""
+        self.set_status(f"Saved {path}")
+    
     def set_status(self, message):
-        """Set the status bar message."""
+        """Set status bar message."""
         self.status_label.setText(message) 
